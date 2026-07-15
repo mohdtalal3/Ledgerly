@@ -32,6 +32,12 @@ export function calculateTransferFee(amount: Decimal.Value, feeValue: Decimal.Va
   return (mode === "percent" ? transferAmount.mul(value).div(100) : value).toFixed(4);
 }
 
+export function calculateTransferNetAmount(amount: Decimal.Value, feeAmount: Decimal.Value) {
+  const netAmount = decimal(amount).minus(decimal(feeAmount));
+  if (netAmount.lte(0)) throw new Error("Transfer fee must be less than the transfer amount");
+  return netAmount.toFixed(4);
+}
+
 export function calculateLoanOutstanding(entries: Array<{ entryType: "lend" | "repayment"; amountPkr: Decimal.Value }>) {
   return entries.reduce((balance, entry) => balance.plus(decimal(entry.amountPkr).mul(entry.entryType === "lend" ? 1 : -1)), decimal(0)).toFixed(4);
 }

@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { DEFAULT_PROFILE_ID } from "@/lib/constants";
 import { requireSession } from "@/lib/auth/session";
-import { calculateLoanOutstanding, calculateTax, calculateTransferFee, decimal, convertMoney } from "@/lib/finance";
+import { calculateLoanOutstanding, calculateTax, calculateTransferFee, calculateTransferNetAmount, decimal, convertMoney } from "@/lib/finance";
 import { getSupabaseAdmin } from "@/lib/supabase/server";
 import { accountSchema, loanEntrySchema, settingsSchema, taxPaymentSchema, transactionSchema, transferSchema } from "@/lib/validations";
 
@@ -71,13 +71,16 @@ export async function saveTransfer(_: ActionState, form: FormData): Promise<Acti
   const [{ data: balance },{ data: settings }] = await Promise.all([db.from("account_balances").select("current_balance,default_currency").eq("id",v.fromAccountId).single(),db.from("app_settings").select("allow_negative_balances").eq("profile_id",DEFAULT_PROFILE_ID).single()]);
   const feeAmount=calculateTransferFee(v.amount,v.fee,v.feeMode);
   const feeConverted=Number(feeAmount)>0?convertMoney(feeAmount,v.currency,v.exchangeRate):{amountPkr:"0",amountUsd:"0"};
-  const debit = balance?.default_currency === "USD" ? Number(converted.amountUsd)+Number(feeConverted.amountUsd) : Number(converted.amountPkr)+Number(feeConverted.amountPkr);
+  const netAmount=calculateTransferNetAmount(v.amount,feeAmount);
+  const netConverted=convertMoney(netAmount,v.currency,v.exchangeRate);
+  const debit = balance?.default_currency === "USD" ? Number(converted.amountUsd) : Number(converted.amountPkr);
   if (!settings?.allow_negative_balances && Number(balance?.current_balance ?? 0) < debit) return { error:"The source account does not have enough money" };
   const { data: transfer,error }=await db.from("transfers").insert({profile_id:DEFAULT_PROFILE_ID,from_account_id:v.fromAccountId,to_account_id:v.toAccountId,transfer_date:v.date,original_amount:v.amount,original_currency:v.currency,exchange_rate:v.exchangeRate,fee_amount:feeAmount,notes:v.notes||null}).select("id").single();
   if(error) return {error:error.message};
-  const common={profile_id:DEFAULT_PROFILE_ID,transaction_date:v.date,original_amount:v.amount,original_currency:v.currency,exchange_rate:v.exchangeRate,amount_pkr:converted.amountPkr,amount_usd:converted.amountUsd,transfer_id:transfer.id,notes:v.notes||null};
-  type TransferTransactionRow=Omit<typeof common,"original_amount">&{original_amount:number|string;account_id:string;type:string;description:string;expense_category_id?:string};
-  const rows:TransferTransactionRow[]=[{...common,account_id:v.fromAccountId,type:"transfer_out",description:"Account transfer"},{...common,account_id:v.toAccountId,type:"transfer_in",description:"Account transfer"}];
+  const common={profile_id:DEFAULT_PROFILE_ID,transaction_date:v.date,original_currency:v.currency,exchange_rate:v.exchangeRate,transfer_id:transfer.id,notes:v.notes||null};
+  type TransferTransactionRow=typeof common&{original_amount:number|string;amount_pkr:string;amount_usd:string;account_id:string;type:string;description:string;expense_category_id?:string};
+  const transferRow={...common,original_amount:netAmount,amount_pkr:netConverted.amountPkr,amount_usd:netConverted.amountUsd};
+  const rows:TransferTransactionRow[]=[{...transferRow,account_id:v.fromAccountId,type:"transfer_out",description:`Account transfer (${v.amount} ${v.currency} total)`},{...transferRow,account_id:v.toAccountId,type:"transfer_in",description:"Account transfer received"}];
   if(Number(feeAmount)>0){const{data:other}=await db.from("expense_categories").select("id").eq("profile_id",DEFAULT_PROFILE_ID).eq("name","Other").single();rows.push({...common,account_id:v.fromAccountId,type:"expense",description:`Transfer fee (${v.feeMode === "percent" ? `${v.fee}%` : "fixed"})`,original_amount:feeAmount,amount_pkr:feeConverted.amountPkr,amount_usd:feeConverted.amountUsd,expense_category_id:other?.id});}
   const {error:txError}=await db.from("transactions").insert(rows);
   if(txError){await db.from("transfers").delete().eq("id",transfer.id);return {error:txError.message};}

@@ -22,6 +22,8 @@ export function TransferForm({ accounts, settings }: { accounts: Account[]; sett
     return feeMode === "percent" ? amountValue * feeValue / 100 : feeValue;
   }, [amount, fee, feeMode]);
 
+  const recipientAmount = Math.max(0, (Number(amount) || 0) - calculatedFee);
+
   useEffect(() => {
     if (state.ok) {
       toast.success("Transfer recorded");
@@ -38,7 +40,7 @@ export function TransferForm({ accounts, settings }: { accounts: Account[]; sett
     <div className="field"><label>USD → PKR RATE</label><input name="exchangeRate" type="number" min="0.000001" step="any" defaultValue={settings.usd_to_pkr_rate} required /></div>
     <div className="field"><label>FEE METHOD</label><select name="feeMode" value={feeMode} onChange={event => setFeeMode(event.target.value as "fixed" | "percent")}><option value="fixed">Fixed amount</option><option value="percent">Percentage</option></select></div>
     <div className="field"><label>{feeMode === "percent" ? "FEE PERCENTAGE" : "FEE AMOUNT"}</label><input name="fee" type="number" min="0" max={feeMode === "percent" ? "100" : undefined} step="0.01" value={fee} onChange={event => setFee(event.target.value)} /></div>
-    <div className="chip span-2" style={{ justifySelf: "start" }}>Fee charged: {new Intl.NumberFormat("en-PK", { style: "currency", currency, maximumFractionDigits: currency === "PKR" ? 2 : 4 }).format(Math.max(0, calculatedFee || 0))}</div>
+    <div className="chip span-2" style={{ justifySelf: "start" }}>Total deducted: {new Intl.NumberFormat("en-PK", { style: "currency", currency, maximumFractionDigits: currency === "PKR" ? 2 : 4 }).format(Math.max(0, Number(amount) || 0))} · Recipient receives: {new Intl.NumberFormat("en-PK", { style: "currency", currency, maximumFractionDigits: currency === "PKR" ? 2 : 4 }).format(recipientAmount)} · Fee: {new Intl.NumberFormat("en-PK", { style: "currency", currency, maximumFractionDigits: currency === "PKR" ? 2 : 4 }).format(Math.max(0, calculatedFee || 0))}</div>
     <div className="field span-2"><label>NOTES</label><input name="notes" /></div>
     {state.error && <div className="form-message span-2">{state.error}</div>}
     <button className="btn primary span-2" disabled={pending}>{pending ? <LoaderCircle className="animate-spin" size={18} /> : <ArrowRight size={18} />}Move money</button>

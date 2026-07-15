@@ -40,7 +40,8 @@ export const transferSchema = z.object({
   notes: z.string().trim().max(1000).optional().default(""),
 }).superRefine((v, ctx) => {
   if (v.fromAccountId === v.toAccountId) ctx.addIssue({ code: "custom", path: ["toAccountId"], message: "Choose a different destination" });
-  if (v.feeMode === "percent" && v.fee > 100) ctx.addIssue({ code: "custom", path: ["fee"], message: "Fee percentage cannot exceed 100%" });
+  if (v.feeMode === "percent" && v.fee >= 100) ctx.addIssue({ code: "custom", path: ["fee"], message: "Fee percentage must be less than 100%" });
+  if (v.feeMode === "fixed" && v.fee >= v.amount) ctx.addIssue({ code: "custom", path: ["fee"], message: "Fee must be less than the transfer amount" });
 });
 
 export const accountSchema = z.object({
