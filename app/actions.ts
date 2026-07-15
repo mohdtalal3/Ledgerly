@@ -4,9 +4,9 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { DEFAULT_PROFILE_ID } from "@/lib/constants";
 import { requireSession } from "@/lib/auth/session";
-import { convertMoney, calculateTax } from "@/lib/finance";
+import { calculateLoanOutstanding, calculateTax, calculateTransferFee, decimal, convertMoney } from "@/lib/finance";
 import { getSupabaseAdmin } from "@/lib/supabase/server";
-import { accountSchema, settingsSchema, taxPaymentSchema, transactionSchema, transferSchema } from "@/lib/validations";
+import { accountSchema, loanEntrySchema, settingsSchema, taxPaymentSchema, transactionSchema, transferSchema } from "@/lib/validations";
 
 export type ActionState = { ok?: boolean; error?: string };
 const text = (form: FormData, name: string) => String(form.get(name) ?? "");
@@ -56,24 +56,29 @@ export async function deleteTransaction(id: string) {
     const{data:payment}=await db.from("tax_payments").select("liability_id").eq("transaction_id",id).maybeSingle();
     if(payment){await db.from("tax_payments").delete().eq("transaction_id",id);const{data:liability}=await db.from("tax_liabilities").select("amount_pkr,tax_payments(amount_pkr)").eq("id",payment.liability_id).single();const paid=(liability?.tax_payments as{amount_pkr:string}[]|undefined)?.reduce((n,p)=>n+Number(p.amount_pkr),0)??0;const status=paid<=0?"unpaid":paid>=Number(liability?.amount_pkr??0)-0.0001?"paid":"partial";await db.from("tax_liabilities").update({status}).eq("id",payment.liability_id)}
     await db.from("transactions").update({deleted_at:deletedAt}).eq("id",id);
+  }else if(transaction?.type==="loan_out"||transaction?.type==="loan_repayment"){
+    await db.from("loan_entries").delete().eq("transaction_id",id).eq("profile_id",DEFAULT_PROFILE_ID);
+    await db.from("transactions").update({deleted_at:deletedAt}).eq("id",id).eq("profile_id",DEFAULT_PROFILE_ID);
   }else await db.from("transactions").update({ deleted_at:deletedAt }).eq("id",id).eq("profile_id",DEFAULT_PROFILE_ID);
   revalidatePath("/", "layout");
 }
 
 export async function saveTransfer(_: ActionState, form: FormData): Promise<ActionState> {
   await requireSession();
-  const parsed = transferSchema.safeParse({ fromAccountId:text(form,"fromAccountId"),toAccountId:text(form,"toAccountId"),amount:text(form,"amount"),currency:text(form,"currency"),date:text(form,"date"),exchangeRate:text(form,"exchangeRate"),fee:text(form,"fee"),notes:text(form,"notes") });
+  const parsed = transferSchema.safeParse({ fromAccountId:text(form,"fromAccountId"),toAccountId:text(form,"toAccountId"),amount:text(form,"amount"),currency:text(form,"currency"),date:text(form,"date"),exchangeRate:text(form,"exchangeRate"),feeMode:text(form,"feeMode"),fee:text(form,"fee"),notes:text(form,"notes") });
   if (!parsed.success) return { error:parsed.error.issues[0]?.message ?? "Check the transfer" };
   const v=parsed.data, db=getSupabaseAdmin(), converted=convertMoney(v.amount,v.currency,v.exchangeRate);
   const [{ data: balance },{ data: settings }] = await Promise.all([db.from("account_balances").select("current_balance,default_currency").eq("id",v.fromAccountId).single(),db.from("app_settings").select("allow_negative_balances").eq("profile_id",DEFAULT_PROFILE_ID).single()]);
-  const feeConverted=v.fee>0?convertMoney(v.fee,v.currency,v.exchangeRate):{amountPkr:"0",amountUsd:"0"};
+  const feeAmount=calculateTransferFee(v.amount,v.fee,v.feeMode);
+  const feeConverted=Number(feeAmount)>0?convertMoney(feeAmount,v.currency,v.exchangeRate):{amountPkr:"0",amountUsd:"0"};
   const debit = balance?.default_currency === "USD" ? Number(converted.amountUsd)+Number(feeConverted.amountUsd) : Number(converted.amountPkr)+Number(feeConverted.amountPkr);
   if (!settings?.allow_negative_balances && Number(balance?.current_balance ?? 0) < debit) return { error:"The source account does not have enough money" };
-  const { data: transfer,error }=await db.from("transfers").insert({profile_id:DEFAULT_PROFILE_ID,from_account_id:v.fromAccountId,to_account_id:v.toAccountId,transfer_date:v.date,original_amount:v.amount,original_currency:v.currency,exchange_rate:v.exchangeRate,fee_amount:v.fee,notes:v.notes||null}).select("id").single();
+  const { data: transfer,error }=await db.from("transfers").insert({profile_id:DEFAULT_PROFILE_ID,from_account_id:v.fromAccountId,to_account_id:v.toAccountId,transfer_date:v.date,original_amount:v.amount,original_currency:v.currency,exchange_rate:v.exchangeRate,fee_amount:feeAmount,notes:v.notes||null}).select("id").single();
   if(error) return {error:error.message};
   const common={profile_id:DEFAULT_PROFILE_ID,transaction_date:v.date,original_amount:v.amount,original_currency:v.currency,exchange_rate:v.exchangeRate,amount_pkr:converted.amountPkr,amount_usd:converted.amountUsd,transfer_id:transfer.id,notes:v.notes||null};
-  const rows=[{...common,account_id:v.fromAccountId,type:"transfer_out",description:"Account transfer"},{...common,account_id:v.toAccountId,type:"transfer_in",description:"Account transfer"}];
-  if(v.fee>0){const{data:other}=await db.from("expense_categories").select("id").eq("profile_id",DEFAULT_PROFILE_ID).eq("name","Other").single();rows.push({...common,account_id:v.fromAccountId,type:"expense",description:"Transfer fee",original_amount:v.fee,amount_pkr:feeConverted.amountPkr,amount_usd:feeConverted.amountUsd,expense_category_id:other?.id} as typeof rows[number]);}
+  type TransferTransactionRow=Omit<typeof common,"original_amount">&{original_amount:number|string;account_id:string;type:string;description:string;expense_category_id?:string};
+  const rows:TransferTransactionRow[]=[{...common,account_id:v.fromAccountId,type:"transfer_out",description:"Account transfer"},{...common,account_id:v.toAccountId,type:"transfer_in",description:"Account transfer"}];
+  if(Number(feeAmount)>0){const{data:other}=await db.from("expense_categories").select("id").eq("profile_id",DEFAULT_PROFILE_ID).eq("name","Other").single();rows.push({...common,account_id:v.fromAccountId,type:"expense",description:`Transfer fee (${v.feeMode === "percent" ? `${v.fee}%` : "fixed"})`,original_amount:feeAmount,amount_pkr:feeConverted.amountPkr,amount_usd:feeConverted.amountUsd,expense_category_id:other?.id});}
   const {error:txError}=await db.from("transactions").insert(rows);
   if(txError){await db.from("transfers").delete().eq("id",transfer.id);return {error:txError.message};}
   revalidatePath("/","layout"); return {ok:true};
@@ -86,6 +91,31 @@ export async function payTax(_:ActionState, form:FormData):Promise<ActionState>{
   if(!settings?.usd_to_pkr_rate)return{error:"No exchange rate is available"};
   const {error}=await db.rpc("record_tax_payment",{p_profile_id:DEFAULT_PROFILE_ID,p_liability_id:parsed.data.liabilityId,p_account_id:parsed.data.accountId,p_amount:parsed.data.amount,p_currency:"PKR",p_rate:settings.usd_to_pkr_rate,p_date:parsed.data.date,p_notes:parsed.data.notes??null});
   if(error)return{error:error.message}; revalidatePath("/","layout"); return{ok:true};
+}
+
+export async function saveLoanEntry(_:ActionState,form:FormData):Promise<ActionState>{
+  await requireSession();
+  const parsed=loanEntrySchema.safeParse({entryType:text(form,"entryType"),contactId:text(form,"contactId")||undefined,personName:text(form,"personName"),accountId:text(form,"accountId"),amount:text(form,"amount"),currency:text(form,"currency"),date:text(form,"date"),exchangeRate:text(form,"exchangeRate"),notes:text(form,"notes")});
+  if(!parsed.success)return{error:parsed.error.issues[0]?.message??"Check the loan entry"};
+  const v=parsed.data,db=getSupabaseAdmin();let contact:{id:string;name:string}|null=null;
+  if(v.contactId){const{data}=await db.from("loan_contacts").select("id,name").eq("id",v.contactId).eq("profile_id",DEFAULT_PROFILE_ID).single();contact=data;}
+  else{const name=v.personName.trim();const{data:existing}=await db.from("loan_contacts").select("id,name").eq("profile_id",DEFAULT_PROFILE_ID).eq("name_key",name.toLocaleLowerCase()).maybeSingle();contact=existing;if(!contact&&v.entryType==="lend"){const{data,error}=await db.from("loan_contacts").insert({profile_id:DEFAULT_PROFILE_ID,name}).select("id,name").single();if(error)return{error:error.message};contact=data;}}
+  if(!contact)return{error:v.entryType==="repayment"?"Choose an existing person for a repayment":"Unable to find or create this person"};
+  const converted=convertMoney(v.amount,v.currency,v.exchangeRate);
+  if(v.entryType==="repayment"){
+    const{data:entries,error}=await db.from("loan_entries").select("entry_type,amount_pkr").eq("contact_id",contact.id).eq("profile_id",DEFAULT_PROFILE_ID);if(error)return{error:error.message};
+    const outstanding=calculateLoanOutstanding((entries??[]).map(e=>({entryType:e.entry_type==="lend"?"lend" as const:"repayment" as const,amountPkr:e.amount_pkr})));
+    if(decimal(converted.amountPkr).gt(decimal(outstanding)))return{error:`Repayment exceeds ${contact.name}'s outstanding balance`};
+  }else{
+    const{data:balance}=await db.from("account_balances").select("current_balance,default_currency").eq("id",v.accountId).eq("profile_id",DEFAULT_PROFILE_ID).single();
+    const{data:settings}=await db.from("app_settings").select("allow_negative_balances").eq("profile_id",DEFAULT_PROFILE_ID).single();
+    const debit=balance?.default_currency==="USD"?Number(converted.amountUsd):Number(converted.amountPkr);if(!settings?.allow_negative_balances&&Number(balance?.current_balance??0)<debit)return{error:"The selected account does not have enough money"};
+  }
+  const transactionType=v.entryType==="lend"?"loan_out":"loan_repayment";const description=v.entryType==="lend"?`Loan to ${contact.name}`:`Loan repayment from ${contact.name}`;
+  const{data:transaction,error:txError}=await db.from("transactions").insert({profile_id:DEFAULT_PROFILE_ID,account_id:v.accountId,type:transactionType,transaction_date:v.date,original_amount:v.amount,original_currency:v.currency,exchange_rate:v.exchangeRate,amount_pkr:converted.amountPkr,amount_usd:converted.amountUsd,description,notes:v.notes||null}).select("id").single();if(txError)return{error:txError.message};
+  const{error}=await db.from("loan_entries").insert({profile_id:DEFAULT_PROFILE_ID,contact_id:contact.id,transaction_id:transaction.id,entry_type:v.entryType,entry_date:v.date,original_amount:v.amount,original_currency:v.currency,exchange_rate:v.exchangeRate,amount_pkr:converted.amountPkr,amount_usd:converted.amountUsd,notes:v.notes||null});
+  if(error){await db.from("transactions").update({deleted_at:new Date().toISOString()}).eq("id",transaction.id);return{error:error.message};}
+  revalidatePath("/","layout");return{ok:true};
 }
 
 export async function saveAccount(_:ActionState,form:FormData):Promise<ActionState>{

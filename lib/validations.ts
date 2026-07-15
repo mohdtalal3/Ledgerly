@@ -35,9 +35,13 @@ export const transferSchema = z.object({
   currency,
   date,
   exchangeRate: money,
+  feeMode: z.enum(["fixed", "percent"]).default("fixed"),
   fee: z.coerce.number().min(0).max(1_000_000_000).default(0),
   notes: z.string().trim().max(1000).optional().default(""),
-}).refine((v) => v.fromAccountId !== v.toAccountId, { path: ["toAccountId"], message: "Choose a different destination" });
+}).superRefine((v, ctx) => {
+  if (v.fromAccountId === v.toAccountId) ctx.addIssue({ code: "custom", path: ["toAccountId"], message: "Choose a different destination" });
+  if (v.feeMode === "percent" && v.fee > 100) ctx.addIssue({ code: "custom", path: ["fee"], message: "Fee percentage cannot exceed 100%" });
+});
 
 export const accountSchema = z.object({
   id: uuid.optional(), name: z.string().trim().min(1).max(80), type: z.enum(["cash", "bank", "wallet"]),
@@ -51,3 +55,17 @@ export const settingsSchema = z.object({
 });
 
 export const taxPaymentSchema = z.object({ liabilityId: uuid, accountId: uuid, amount: money, date, notes: z.string().max(500).optional() });
+
+export const loanEntrySchema = z.object({
+  entryType: z.enum(["lend", "repayment"]),
+  contactId: uuid.optional(),
+  personName: z.string().trim().max(120).optional().default(""),
+  accountId: uuid,
+  amount: money,
+  currency,
+  date,
+  exchangeRate: money,
+  notes: z.string().trim().max(1000).optional().default(""),
+}).refine((value) => Boolean(value.contactId || value.personName), {
+  path: ["personName"], message: "Choose a person or enter a new name",
+});

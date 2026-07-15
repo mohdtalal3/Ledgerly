@@ -10,8 +10,10 @@ Ledgerly is a private, mobile-first personal expense tracker for PKR and USD. It
 - PKR/USD original values, automatic 12-hour USD→PKR refreshes, per-transaction rate overrides, and approximate converted values.
 - Tax liabilities generated from taxable income at a configurable percentage; partial/full tax payments reduce the selected account only when paid.
 - Account-to-account transfers that do not count as income or expenses, with balance checks and optional negative balances.
+- Person-based loan tracking with repeated lending, repayments, searchable totals, and outstanding balances. Loans debit/credit the selected account without affecting income or expense analytics.
 - Accounts, categories, income sources, general financial rules, theme preference, and security controls in Settings.
 - Responsive report table and authenticated CSV export.
+- Server-rendered pagination with 25 rows per page across transaction, income, expense, transfer, loan, tax, and report histories. Dashboard loads exactly six recent transactions.
 - Mobile bottom navigation and compact desktop sidebar, dark system theme, touch-friendly controls, empty states, and toast feedback.
 
 ## Local development
@@ -50,6 +52,10 @@ The schema enables RLS but deliberately creates no browser roles/policies. All a
 
 The migration seeds one future-compatible profile plus Cash, HBL, Payoneer, JazzCash, thirteen expense categories, and five income sources. All financial tables carry `profile_id` so Supabase Auth and multiple users can be added later.
 
+If Ledgerly was installed before the Loans feature was added, run [`supabase/loans-migration.sql`](supabase/loans-migration.sql) once in the SQL Editor. Do not rerun the full schema on an existing database.
+
+If the main schema was already installed before server pagination was added, run [`supabase/pagination-migration.sql`](supabase/pagination-migration.sql) once. Fresh installations only need the current `schema.sql`.
+
 ## Authentication
 
 The login Route Handler receives a PIN, hashes both values with SHA-256, and performs a timing-safe comparison against `APP_LOGIN_PIN`. On success it signs a two-week JWT stored in the `ledgerly_session` cookie with `HttpOnly`, `SameSite=Lax`, and `Secure` in production. Middleware performs an early cookie-presence redirect, while the protected layout cryptographically verifies the token.
@@ -84,6 +90,10 @@ Taxable income creates a liability linked one-to-one to its income transaction. 
 
 A transfer has a parent record and linked debit/credit transaction rows. Those rows affect source/destination balances but are excluded from income and expense totals. Source and destination must differ. The server checks calculated source balance unless negative balances are enabled. An optional transfer fee creates a linked expense in the default “Other” category.
 
+### Loans and repayments
+
+Loan activity is grouped by a normalized person name. Entering `Talal` again reuses Talal’s existing record, or the person can be selected explicitly. A lending entry creates a `loan_out` transaction and debits its source account. A repayment creates a `loan_repayment` transaction, credits the receiving cash/bank/wallet account, and reduces that person’s outstanding amount. Neither is counted as income or expense. Repayments above the person’s outstanding PKR-equivalent balance are rejected. Original currency, applied exchange rate, converted values, date, account, and notes remain attached to every entry.
+
 ## Verification
 
 ```bash
@@ -93,6 +103,10 @@ npm run build
 ```
 
 The finance unit tests cover exact conversion, configurable tax, signed ledger direction, and decimal summation.
+
+## Data loading and pagination
+
+Ledger pages are Server Components and fetch only the requested 25-row range with an exact database count. Filters and page numbers are URL parameters, so navigation issues a new server query rather than loading a large client-side collection. Dashboard fetches six recent transactions; financial/category/tax/loan totals are calculated inside PostgreSQL through aggregate views/functions. CSV export is streamed on demand in 500-row server batches so it remains complete without holding the entire ledger in memory.
 
 ## Vercel deployment
 

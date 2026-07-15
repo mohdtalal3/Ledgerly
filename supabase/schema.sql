@@ -3,8 +3,9 @@ create extension if not exists pgcrypto;
 
 create type public.currency_code as enum ('PKR', 'USD');
 create type public.account_kind as enum ('cash', 'bank', 'wallet');
-create type public.transaction_kind as enum ('income', 'expense', 'transfer_in', 'transfer_out', 'tax_payment', 'opening_balance', 'adjustment');
+create type public.transaction_kind as enum ('income', 'expense', 'transfer_in', 'transfer_out', 'tax_payment', 'loan_out', 'loan_repayment', 'opening_balance', 'adjustment');
 create type public.tax_status as enum ('unpaid', 'partial', 'paid');
+create type public.loan_entry_kind as enum ('lend', 'repayment');
 
 create table public.app_profiles (
   id uuid primary key default gen_random_uuid(),
@@ -47,6 +48,15 @@ create table public.income_sources (
   created_at timestamptz not null default now(), updated_at timestamptz not null default now(), unique(profile_id, name)
 );
 
+create table public.loan_contacts (
+  id uuid primary key default gen_random_uuid(), profile_id uuid not null references public.app_profiles(id) on delete cascade,
+  name text not null check (length(trim(name)) between 1 and 120),
+  name_key text generated always as (lower(trim(name))) stored,
+  phone text, notes text, is_archived boolean not null default false,
+  created_at timestamptz not null default now(), updated_at timestamptz not null default now(),
+  unique(profile_id, name_key)
+);
+
 create table public.transfers (
   id uuid primary key default gen_random_uuid(), profile_id uuid not null references public.app_profiles(id) on delete cascade,
   from_account_id uuid not null references public.accounts(id), to_account_id uuid not null references public.accounts(id),
@@ -68,6 +78,17 @@ create table public.transactions (
   created_at timestamptz not null default now(), updated_at timestamptz not null default now(), deleted_at timestamptz,
   check ((type <> 'expense') or expense_category_id is not null),
   check ((type <> 'income') or income_source_id is not null)
+);
+
+create table public.loan_entries (
+  id uuid primary key default gen_random_uuid(), profile_id uuid not null references public.app_profiles(id) on delete cascade,
+  contact_id uuid not null references public.loan_contacts(id) on delete restrict,
+  transaction_id uuid not null unique references public.transactions(id) on delete cascade,
+  entry_type public.loan_entry_kind not null, entry_date date not null,
+  original_amount numeric(20,4) not null check (original_amount > 0), original_currency public.currency_code not null,
+  exchange_rate numeric(20,6) not null check (exchange_rate > 0),
+  amount_pkr numeric(20,4) not null check (amount_pkr > 0), amount_usd numeric(20,4) not null check (amount_usd > 0),
+  notes text, created_at timestamptz not null default now(), updated_at timestamptz not null default now()
 );
 
 create table public.tax_liabilities (
@@ -104,10 +125,12 @@ create index transactions_category_idx on public.transactions(expense_category_i
 create index transactions_source_idx on public.transactions(income_source_id) where deleted_at is null;
 create index tax_liabilities_profile_status_idx on public.tax_liabilities(profile_id, status);
 create index tax_payments_liability_idx on public.tax_payments(liability_id);
+create index loan_contacts_profile_name_idx on public.loan_contacts(profile_id, name_key) where is_archived is false;
+create index loan_entries_contact_date_idx on public.loan_entries(contact_id, entry_date desc);
 
 create or replace function public.set_updated_at() returns trigger language plpgsql as $$
 begin new.updated_at = now(); return new; end $$;
-do $$ declare t text; begin foreach t in array array['app_profiles','app_settings','accounts','expense_categories','income_sources','transactions','transfers','tax_liabilities'] loop
+do $$ declare t text; begin foreach t in array array['app_profiles','app_settings','accounts','expense_categories','income_sources','loan_contacts','loan_entries','transactions','transfers','tax_liabilities'] loop
   execute format('create trigger %I before update on public.%I for each row execute function public.set_updated_at()', t || '_updated_at', t);
 end loop; end $$;
 
@@ -115,10 +138,60 @@ end loop; end $$;
 create or replace view public.account_balances with (security_invoker = false) as
 select a.id, a.profile_id, a.name, a.account_type, a.default_currency, a.opening_balance, a.icon, a.notes, a.sort_order, a.is_archived,
   a.opening_balance + coalesce(sum(case
-    when t.type in ('income','transfer_in','opening_balance') then case when a.default_currency='PKR' then t.amount_pkr else t.amount_usd end
+    when t.type::text in ('income','transfer_in','loan_repayment','opening_balance') then case when a.default_currency='PKR' then t.amount_pkr else t.amount_usd end
     else -case when a.default_currency='PKR' then t.amount_pkr else t.amount_usd end end),0) as current_balance
 from public.accounts a left join public.transactions t on t.account_id=a.id and t.deleted_at is null
 group by a.id;
+
+create or replace view public.loan_contact_balances with (security_invoker = false) as
+select c.id, c.profile_id, c.name, c.phone, c.notes, c.is_archived,
+  coalesce(sum(le.amount_pkr) filter (where le.entry_type='lend'),0) as total_lent_pkr,
+  coalesce(sum(le.amount_pkr) filter (where le.entry_type='repayment'),0) as total_returned_pkr,
+  coalesce(sum(case when le.entry_type='lend' then le.amount_pkr else -le.amount_pkr end),0) as outstanding_pkr,
+  count(le.id)::integer as entry_count
+from public.loan_contacts c left join public.loan_entries le on le.contact_id=c.id
+group by c.id;
+
+create or replace view public.tax_liability_balances with (security_invoker = false) as
+select tl.id, tl.profile_id, tl.income_transaction_id, tl.tax_percentage, tl.amount_pkr, tl.amount_usd, tl.status, tl.created_at,
+  t.description as income_description, t.transaction_date as income_date, t.original_amount as income_original_amount, t.original_currency as income_original_currency,
+  coalesce(sum(tp.amount_pkr),0) as paid_pkr
+from public.tax_liabilities tl
+join public.transactions t on t.id=tl.income_transaction_id
+left join public.tax_payments tp on tp.liability_id=tl.id
+group by tl.id,t.id;
+
+create or replace function public.period_financial_summary(p_profile_id uuid, p_start date, p_end date)
+returns jsonb language sql stable security definer set search_path=public as $$
+  select jsonb_build_object(
+    'income', coalesce(sum(t.amount_pkr) filter(where t.type='income'),0),
+    'expenses', coalesce(sum(t.amount_pkr) filter(where t.type='expense'),0),
+    'incomeCount', count(*) filter(where t.type='income'),
+    'expenseCount', count(*) filter(where t.type='expense'),
+    'incomeMax', coalesce(max(t.amount_pkr) filter(where t.type='income'),0),
+    'expenseMax', coalesce(max(t.amount_pkr) filter(where t.type='expense'),0),
+    'categories', (select coalesce(jsonb_agg(jsonb_build_object('name',x.name,'value',x.value) order by x.value desc),'[]'::jsonb) from (
+      select coalesce(c.name,'Other') name,sum(e.amount_pkr) value from transactions e
+      left join expense_categories c on c.id=e.expense_category_id
+      where e.profile_id=p_profile_id and e.deleted_at is null and e.type='expense' and e.transaction_date>=p_start and e.transaction_date<p_end
+      group by coalesce(c.name,'Other')
+    ) x),
+    'taxGenerated', (select coalesce(sum(amount_pkr),0) from tax_liabilities where profile_id=p_profile_id),
+    'taxPaid', (select coalesce(sum(amount_pkr),0) from tax_payments where profile_id=p_profile_id),
+    'openTaxCount', (select count(*) from tax_liabilities where profile_id=p_profile_id and status<>'paid')
+  )
+  from transactions t where t.profile_id=p_profile_id and t.deleted_at is null and t.transaction_date>=p_start and t.transaction_date<p_end;
+$$;
+
+create or replace function public.loan_financial_summary(p_profile_id uuid)
+returns jsonb language sql stable security definer set search_path=public as $$
+  select jsonb_build_object(
+    'totalLent', coalesce(sum(amount_pkr) filter(where entry_type='lend'),0),
+    'totalReturned', coalesce(sum(amount_pkr) filter(where entry_type='repayment'),0),
+    'outstanding', coalesce(sum(case when entry_type='lend' then amount_pkr else -amount_pkr end),0),
+    'peopleWithBalance', (select count(*) from loan_contact_balances where profile_id=p_profile_id and outstanding_pkr>0)
+  ) from loan_entries where profile_id=p_profile_id;
+$$;
 
 -- Atomically pays one liability and updates its derived status.
 create or replace function public.record_tax_payment(
@@ -147,6 +220,8 @@ alter table public.app_settings enable row level security;
 alter table public.accounts enable row level security;
 alter table public.expense_categories enable row level security;
 alter table public.income_sources enable row level security;
+alter table public.loan_contacts enable row level security;
+alter table public.loan_entries enable row level security;
 alter table public.transactions enable row level security;
 alter table public.transfers enable row level security;
 alter table public.tax_liabilities enable row level security;
