@@ -15,6 +15,7 @@ Ledgerly is a private, mobile-first personal expense tracker for PKR and USD. It
 - Responsive report table and authenticated CSV export.
 - Server-rendered pagination with 25 rows per page across transaction, income, expense, transfer, loan, tax, and report histories. Dashboard loads exactly six recent transactions.
 - Mobile bottom navigation and compact desktop sidebar, dark system theme, touch-friendly controls, empty states, and toast feedback.
+- Sticky mobile header with a “More” bottom sheet for Transactions, Transfers, Loans, Tax, Reports, Settings, and Logout.
 
 ## Local development
 
