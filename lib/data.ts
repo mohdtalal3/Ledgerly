@@ -23,6 +23,7 @@ export type TaxLiability={id:string;amount_pkr:string;amount_usd:string;tax_perc
 export type LoanSummary={totalLent:number;totalReturned:number;outstanding:number;peopleWithBalance:number};
 
 function pageNumber(value?:number){return Number.isInteger(value)&&Number(value)>0?Number(value):1}
+function validUuid(value?:string){return Boolean(value&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value))}
 function result<T>(items:T[],count:number,page:number,pageSize=PAGE_SIZE):PageResult<T>{return{items,count,page,pageSize,totalPages:Math.max(1,Math.ceil(count/pageSize))}}
 function monthRange(month:string){const safe=/^\d{4}-\d{2}$/.test(month)?month:new Date().toISOString().slice(0,7);const start=`${safe}-01`;const end=new Date(`${start}T00:00:00Z`);end.setUTCMonth(end.getUTCMonth()+1);return{start,end:end.toISOString().slice(0,10)}}
 
@@ -70,10 +71,10 @@ export async function getTransactions(options: { type?: string; month?: string; 
   return data as unknown as Transaction[];
 }
 
-export async function getTransactionsPage(options:{type?:string;month?:string;search?:string;page?:number;pageSize?:number}={}):Promise<PageResult<Transaction>>{
+export async function getTransactionsPage(options:{type?:string;month?:string;search?:string;accountId?:string;page?:number;pageSize?:number}={}):Promise<PageResult<Transaction>>{
   const page=pageNumber(options.page),pageSize=options.pageSize??PAGE_SIZE,from=(page-1)*pageSize,to=from+pageSize-1;
   let query=getSupabaseAdmin().from("transactions").select("id,type,transaction_date,original_amount,original_currency,amount_pkr,amount_usd,description,merchant,account_id,accounts(name),expense_categories(name),income_sources(name)",{count:"exact"}).eq("profile_id",DEFAULT_PROFILE_ID).is("deleted_at",null).order("transaction_date",{ascending:false}).order("created_at",{ascending:false}).range(from,to);
-  if(options.type)query=query.eq("type",options.type);if(options.search){const search=options.search.replaceAll(",","");query=query.or(`description.ilike.%${search}%,merchant.ilike.%${search}%`)}if(options.month){const{start,end}=monthRange(options.month);query=query.gte("transaction_date",start).lt("transaction_date",end)}
+  if(options.type)query=query.eq("type",options.type);if(validUuid(options.accountId))query=query.eq("account_id",options.accountId!);if(options.search){const search=options.search.replaceAll(",","");query=query.or(`description.ilike.%${search}%,merchant.ilike.%${search}%`)}if(options.month){const{start,end}=monthRange(options.month);query=query.gte("transaction_date",start).lt("transaction_date",end)}
   const{data,error,count}=await query;if(error)throw error;return result(data as unknown as Transaction[],count??0,page,pageSize);
 }
 
