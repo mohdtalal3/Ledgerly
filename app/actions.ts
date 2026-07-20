@@ -6,7 +6,7 @@ import { DEFAULT_PROFILE_ID } from "@/lib/constants";
 import { requireSession } from "@/lib/auth/session";
 import { calculateLoanOutstanding, calculateTax, calculateTransferFee, calculateTransferNetAmount, decimal, convertMoney } from "@/lib/finance";
 import { getSupabaseAdmin } from "@/lib/supabase/server";
-import { accountSchema, loanEntrySchema, settingsSchema, taxPaymentSchema, transactionSchema, transferSchema } from "@/lib/validations";
+import { accountSchema, combinedTaxPaymentSchema, loanEntrySchema, settingsSchema, taxPaymentSchema, transactionSchema, transferSchema } from "@/lib/validations";
 
 export type ActionState = { ok?: boolean; error?: string };
 const text = (form: FormData, name: string) => String(form.get(name) ?? "");
@@ -21,9 +21,10 @@ export async function saveTransaction(_: ActionState, form: FormData): Promise<A
   });
   if (!parsed.success) return { error: parsed.error.issues[0]?.message ?? "Check the form" };
   const value = parsed.data; const converted = convertMoney(value.amount, value.currency, value.exchangeRate); const db = getSupabaseAdmin();
+  if(value.id){const{data:existing,error}=await db.from("transactions").select("type").eq("id",value.id).eq("profile_id",DEFAULT_PROFILE_ID).is("deleted_at",null).single();if(error||!existing)return{error:"Transaction not found"};if(existing.type!==value.type||!["income","expense"].includes(existing.type))return{error:"Transaction type cannot be changed while editing"};}
   const row = { profile_id:DEFAULT_PROFILE_ID, account_id:value.accountId, type:value.type, transaction_date:value.date, original_amount:value.amount,
     original_currency:value.currency, exchange_rate:value.exchangeRate, amount_pkr:converted.amountPkr, amount_usd:converted.amountUsd,
-    description:value.description, notes:value.notes || null, merchant:value.merchant || null, reference:value.reference || null,
+    description:value.description || (value.type === "income" ? "Income" : "Expense"), notes:value.notes || null, merchant:value.merchant || null, reference:value.reference || null,
     expense_category_id:value.categoryId ?? null, income_source_id:value.sourceId ?? null };
   const result = value.id ? await db.from("transactions").update(row).eq("id",value.id).eq("profile_id",DEFAULT_PROFILE_ID).select("id").single()
     : await db.from("transactions").insert(row).select("id").single();
@@ -31,8 +32,11 @@ export async function saveTransaction(_: ActionState, form: FormData): Promise<A
   if (value.type === "income") {
     const { data: setting } = await db.from("app_settings").select("tax_percentage").eq("profile_id",DEFAULT_PROFILE_ID).single();
     const taxRate = value.taxable ? Number(setting?.tax_percentage ?? 5) : 0;
+    const amountPkr=calculateTax(converted.amountPkr,taxRate),amountUsd=calculateTax(converted.amountUsd,taxRate);
+    const{data:existingLiability}=await db.from("tax_liabilities").select("tax_payments(amount_pkr)").eq("income_transaction_id",result.data.id).maybeSingle();
+    const payments=existingLiability?.tax_payments as unknown as Array<{amount_pkr:string}>|null;const paid=(payments??[]).reduce((total,payment)=>total+Number(payment.amount_pkr),0);const due=Number(amountPkr);const status=due<=0||paid>=due-0.0001?"paid":paid>0?"partial":"unpaid";
     const liability = { profile_id:DEFAULT_PROFILE_ID, income_transaction_id:result.data.id, tax_percentage:taxRate,
-      amount_pkr:calculateTax(converted.amountPkr,taxRate), amount_usd:calculateTax(converted.amountUsd,taxRate), status:"unpaid" };
+      amount_pkr:amountPkr, amount_usd:amountUsd, status };
     const { error } = await db.from("tax_liabilities").upsert(liability,{ onConflict:"income_transaction_id" });
     if (error) return { error:`Transaction saved, but tax sync failed: ${error.message}` };
   }
@@ -95,6 +99,18 @@ export async function payTax(_:ActionState, form:FormData):Promise<ActionState>{
   const {error}=await db.rpc("record_tax_payment",{p_profile_id:DEFAULT_PROFILE_ID,p_liability_id:parsed.data.liabilityId,p_account_id:parsed.data.accountId,p_amount:parsed.data.amount,p_currency:"PKR",p_rate:settings.usd_to_pkr_rate,p_date:parsed.data.date,p_notes:parsed.data.notes??null});
   if(error)return{error:error.message}; revalidatePath("/","layout"); return{ok:true};
 }
+
+export async function payCombinedTax(_:ActionState,form:FormData):Promise<ActionState>{
+  await requireSession();const parsed=combinedTaxPaymentSchema.safeParse({taxPercentage:text(form,"taxPercentage"),accountId:text(form,"accountId"),amount:text(form,"amount"),date:text(form,"date"),notes:text(form,"notes")});if(!parsed.success)return{error:parsed.error.issues[0]?.message??"Check the payment"};
+  const v=parsed.data,db=getSupabaseAdmin();const[{data:settings},{data:balance},{data:rows,error:rowsError}]=await Promise.all([db.from("app_settings").select("usd_to_pkr_rate,allow_negative_balances").eq("profile_id",DEFAULT_PROFILE_ID).single(),db.from("account_balances").select("current_balance,default_currency").eq("id",v.accountId).eq("profile_id",DEFAULT_PROFILE_ID).single(),db.from("tax_liability_balances").select("id,amount_pkr,paid_pkr,income_date").eq("profile_id",DEFAULT_PROFILE_ID).eq("tax_percentage",v.taxPercentage).order("income_date")]);
+  if(rowsError)return{error:rowsError.message};if(!settings?.usd_to_pkr_rate)return{error:"No exchange rate is available"};
+  const open=(rows??[]).map(row=>({id:row.id,due:decimal(row.amount_pkr).minus(decimal(row.paid_pkr))})).filter(row=>row.due.gt("0.0001"));const total=open.reduce((sum,row)=>sum.plus(row.due),decimal(0));let remaining=decimal(v.amount);if(remaining.gt(total.plus("0.0001")))return{error:"Payment exceeds outstanding tax"};
+  const converted=convertMoney(v.amount,"PKR",settings.usd_to_pkr_rate);const debit=balance?.default_currency==="USD"?Number(converted.amountUsd):Number(converted.amountPkr);if(!settings.allow_negative_balances&&Number(balance?.current_balance??0)<debit)return{error:"The selected account does not have enough money"};
+  let recorded=false;for(const liability of open){if(remaining.lte(0))break;const portion=DecimalMin(remaining,liability.due);const{error}=await db.rpc("record_tax_payment",{p_profile_id:DEFAULT_PROFILE_ID,p_liability_id:liability.id,p_account_id:v.accountId,p_amount:portion.toFixed(4),p_currency:"PKR",p_rate:settings.usd_to_pkr_rate,p_date:v.date,p_notes:v.notes||`Combined ${v.taxPercentage}% tax payment`});if(error){if(recorded)revalidatePath("/","layout");return{error:recorded?`Part of the payment was recorded. ${error.message}`:error.message};}recorded=true;remaining=remaining.minus(portion)}
+  revalidatePath("/","layout");return{ok:true};
+}
+
+function DecimalMin(a:ReturnType<typeof decimal>,b:ReturnType<typeof decimal>){return a.lte(b)?a:b}
 
 export async function saveLoanEntry(_:ActionState,form:FormData):Promise<ActionState>{
   await requireSession();

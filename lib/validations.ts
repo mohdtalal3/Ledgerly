@@ -15,7 +15,7 @@ export const transactionSchema = z.object({
   currency,
   accountId: uuid,
   date,
-  description: z.string().trim().min(1).max(160),
+  description: z.string().trim().max(160).optional().default(""),
   notes: z.string().trim().max(1000).optional().default(""),
   exchangeRate: money,
   categoryId: uuid.optional(),
@@ -56,6 +56,7 @@ export const settingsSchema = z.object({
 });
 
 export const taxPaymentSchema = z.object({ liabilityId: uuid, accountId: uuid, amount: money, date, notes: z.string().max(500).optional() });
+export const combinedTaxPaymentSchema = z.object({ taxPercentage:z.coerce.number().min(0).max(100),accountId:uuid,amount:money,date,notes:z.string().max(500).optional() });
 
 export const loanEntrySchema = z.object({
   entryType: z.enum(["lend", "repayment"]),

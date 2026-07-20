@@ -16,10 +16,16 @@ export type Transaction = {
   amount_pkr: string; amount_usd: string; description: string; merchant?: string; account_id: string;
   accounts?: { name: string } | null; expense_categories?: { name: string } | null; income_sources?: { name: string } | null;
 };
+export type EditableTransaction = {
+  id:string;type:"income"|"expense";transaction_date:string;original_amount:string;original_currency:"PKR"|"USD";
+  exchange_rate:string;description:string;merchant?:string|null;account_id:string;expense_category_id?:string|null;
+  income_source_id?:string|null;notes?:string|null;reference?:string|null;taxable:boolean;
+};
 export type LoanContactSummary = { id:string; name:string; phone?:string|null; notes?:string|null; totalLentPkr:number; totalReturnedPkr:number; outstandingPkr:number; entryCount:number };
 export type LoanEntry = { id:string;entry_type:"lend"|"repayment";entry_date:string;original_amount:string;original_currency:"PKR"|"USD";amount_pkr:string;amount_usd:string;notes?:string|null;loan_contacts:{name:string};transactions:{accounts:{name:string}|null}|null };
 export type PeriodSummary={income:number;expenses:number;incomeCount:number;expenseCount:number;incomeMax:number;expenseMax:number;categories:Array<{name:string;value:number}>;taxGenerated:number;taxPaid:number;openTaxCount:number};
 export type TaxLiability={id:string;amount_pkr:string;amount_usd:string;tax_percentage:string;status:string;created_at:string;income_description:string;income_date:string;income_original_amount:string;income_original_currency:"PKR"|"USD";paid_pkr:string};
+export type TaxGroup={taxPercentage:string;outstandingPkr:number;liabilityCount:number};
 export type LoanSummary={totalLent:number;totalReturned:number;outstanding:number;peopleWithBalance:number};
 
 function pageNumber(value?:number){return Number.isInteger(value)&&Number(value)>0?Number(value):1}
@@ -43,17 +49,30 @@ export const getAccounts = cache(async (includeArchived = false) => {
   return data as Account[];
 });
 
-export const getCategories = cache(async () => {
-  const { data, error } = await getSupabaseAdmin().from("expense_categories").select("id,name,icon,color").eq("profile_id", DEFAULT_PROFILE_ID).eq("is_archived", false).order("sort_order");
+export const getCategories = cache(async (includeArchived = false) => {
+  let query = getSupabaseAdmin().from("expense_categories").select("id,name,icon,color").eq("profile_id", DEFAULT_PROFILE_ID).order("sort_order");
+  if (!includeArchived) query = query.eq("is_archived", false);
+  const { data, error } = await query;
   if (error) throw error;
   return data as Category[];
 });
 
-export const getSources = cache(async () => {
-  const { data, error } = await getSupabaseAdmin().from("income_sources").select("id,name").eq("profile_id", DEFAULT_PROFILE_ID).eq("is_archived", false).order("sort_order");
+export const getSources = cache(async (includeArchived = false) => {
+  let query = getSupabaseAdmin().from("income_sources").select("id,name").eq("profile_id", DEFAULT_PROFILE_ID).order("sort_order");
+  if (!includeArchived) query = query.eq("is_archived", false);
+  const { data, error } = await query;
   if (error) throw error;
   return data as Source[];
 });
+
+export async function getTransactionForEdit(id:string):Promise<EditableTransaction|null>{
+  if(!validUuid(id))return null;
+  const{data,error}=await getSupabaseAdmin().from("transactions").select("id,type,transaction_date,original_amount,original_currency,exchange_rate,description,merchant,account_id,expense_category_id,income_source_id,notes,reference,tax_liabilities(tax_percentage)").eq("id",id).eq("profile_id",DEFAULT_PROFILE_ID).is("deleted_at",null).in("type",["income","expense"]).maybeSingle();
+  if(error)throw error;if(!data)return null;
+  const relation=data.tax_liabilities as unknown as {tax_percentage:string}|Array<{tax_percentage:string}>|null;
+  const liability=Array.isArray(relation)?relation[0]:relation;
+  return{...data,type:data.type as "income"|"expense",original_currency:data.original_currency as "PKR"|"USD",taxable:Number(liability?.tax_percentage??0)>0} as EditableTransaction;
+}
 
 export async function getTransactions(options: { type?: string; month?: string; search?: string; limit?: number } = {}) {
   let query = getSupabaseAdmin().from("transactions")
@@ -90,6 +109,12 @@ export async function getDashboard(month: string) {
 
 export async function getTaxData(pageValue?:number):Promise<PageResult<TaxLiability>> {
   const page=pageNumber(pageValue),from=(page-1)*PAGE_SIZE;const{data,error,count}=await getSupabaseAdmin().from("tax_liability_balances").select("*",{count:"exact"}).eq("profile_id",DEFAULT_PROFILE_ID).order("created_at",{ascending:false}).range(from,from+PAGE_SIZE-1);if(error)throw error;return result(data as TaxLiability[],count??0,page);
+}
+
+export async function getOpenTaxGroups():Promise<TaxGroup[]>{
+  const{data,error}=await getSupabaseAdmin().from("tax_liability_balances").select("tax_percentage,amount_pkr,paid_pkr").eq("profile_id",DEFAULT_PROFILE_ID).order("tax_percentage");if(error)throw error;
+  const groups=new Map<string,{outstandingPkr:number;liabilityCount:number}>();for(const row of data??[]){const due=Math.max(0,Number(row.amount_pkr)-Number(row.paid_pkr));if(due<=0.0001)continue;const rate=String(row.tax_percentage);const group=groups.get(rate)??{outstandingPkr:0,liabilityCount:0};group.outstandingPkr+=due;group.liabilityCount+=1;groups.set(rate,group)}
+  return Array.from(groups,([taxPercentage,value])=>({taxPercentage,...value}));
 }
 
 export async function getLoanContacts(search?:string,pageValue?:number):Promise<PageResult<LoanContactSummary>>{
